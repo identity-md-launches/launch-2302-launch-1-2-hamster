@@ -48,6 +48,20 @@ contract MiningTest is VaultTest {
         v.bindToken(address(t));
     }
 
+    function test_bindAcceptsDonatedSurplus() public {
+        HamsterVault v = new HamsterVault(team, address(game));
+        MockERC20 t = new MockERC20("x", "x");
+        t.mint(address(v), 8e26);
+        t.mint(address(0xBEEF), 2e26);
+        vm.prank(address(0xBEEF));
+        t.transfer(address(v), 1); // a griefer front-runs the bind with 1 wei
+        vm.prank(team);
+        v.bindToken(address(t));
+        assertEq(v.miningBucket(), 750_000_000e18);
+        assertEq(v.boostBucket(), 50_000_000e18);
+        assertEq(v.trackedHamster(), 8e26); // surplus is untracked
+    }
+
     function test_claimBeforeBindReverts() public {
         HamsterVault v = new HamsterVault(team, address(game));
         _finalize(alice, 1e18);

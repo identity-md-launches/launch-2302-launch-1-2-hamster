@@ -49,7 +49,9 @@ contract HamsterVault {
     uint256 public constant MIN_STAKE = 1e18;
     uint256 public constant MAX_CLAIM_BATCH = 48;
     uint256 public constant MAX_SQUEEKS = 20;
-    uint256 public constant MAX_SYNC = 64;
+    /// @notice Warm-ups end on the next game-window boundary at or after 24 hours, so activations
+    /// due between two interactions are at most ~26 grid points and a sync never needs batching.
+    uint64 public constant ACTIVATION_GRID = 3600;
     uint256 public constant MAX_GRANTS_PER_CALL = 64;
 
     bytes4 internal constant ERC721_INTERFACE = 0x80ac58cd;
@@ -82,11 +84,6 @@ contract HamsterVault {
         uint256 unstakeCursor;
     }
 
-    struct Activation {
-        address account;
-        uint64 activateAt;
-    }
-
     struct Stream {
         uint256 remaining;
         uint64 end;
@@ -112,7 +109,11 @@ contract HamsterVault {
     // ----------------------------------------------------------------- storage: staking
     mapping(address => Account) internal _accounts;
     mapping(address => Unstake[]) internal _unstakes;
-    mapping(uint256 => Activation) internal _queue;
+    /// @dev Queue of distinct activation times (ascending); amount warming up per time; the
+    /// accumulator value at each processed activation time.
+    mapping(uint256 => uint64) internal _queue;
+    mapping(uint64 => uint256) public pendingAt;
+    mapping(uint64 => uint256) internal _rpwAt;
     uint256 public queueHead;
     uint256 public queueTail;
     uint256 public totalWeight;
@@ -159,7 +160,6 @@ contract HamsterVault {
     error BelowMinimum();
     error InvalidAmount();
     error InsufficientStake();
-    error SyncRequired();
     error BoostNotActive();
     error BoostAlreadyActive();
     error BoostSweptAlready();
@@ -190,6 +190,7 @@ contract HamsterVault {
     event BoostSwept(uint256 amount);
     event SqueekRegistered(address indexed account, uint256 indexed tokenId);
     event SqueekUnregistered(address indexed account, uint256 indexed tokenId);
+    event SqueekVoided(address indexed account, uint256 indexed tokenId);
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrancy();
@@ -215,12 +216,14 @@ contract HamsterVault {
 
     // ================================================================= TOKEN BIND
     /// @notice Binds the HAMSTER token once. The token must have the full 1e27 supply and this vault
-    /// must already hold exactly the 8e26 remainder, which becomes the mining and boost buckets.
+    /// must already hold at least the 8e26 remainder, which becomes the mining and boost buckets. Any
+    /// surplus (a donation before the bind) is untracked, like donations after it, so a stray transfer
+    /// cannot block the bind.
     function bindToken(address token_) external onlyTeam {
         if (address(token) != address(0)) revert AlreadyBound();
         if (token_ == address(0)) revert ZeroAddress();
         if (IERC20(token_).totalSupply() != EXPECTED_SUPPLY) revert WrongSupply();
-        if (IERC20(token_).balanceOf(address(this)) != EXPECTED_REMAINDER) revert WrongRemainder();
+        if (IERC20(token_).balanceOf(address(this)) < EXPECTED_REMAINDER) revert WrongRemainder();
         token = IERC20(token_);
         boundAt = uint64(block.timestamp);
         miningBucket = MINING_BUCKET;
@@ -262,7 +265,7 @@ contract HamsterVault {
             if (claimed[k][account]) revert AlreadyClaimed();
             claimed[k][account] = true;
             uint256 b = _baseShare(k, account);
-            uint256 x = b == 0 ? 0 : _allocateBoost(k, account, b * BOOST_PCT / 100);
+            uint256 x = b == 0 ? 0 : _allocateBoost(k, account, b * BOOST_PCT / 100, boost);
             windowClaimed[k] += b;
             base += b;
             boost += x;
@@ -360,29 +363,40 @@ contract HamsterVault {
     }
 
     // ================================================================= STAKING
-    /// @notice Stakes liquid HAMSTER. Weight starts earning 24 hours later. Staking again during a
-    /// warm-up merges the amounts and restarts the 24 hours for the merged pending amount.
+    /// @notice Stakes liquid HAMSTER. Weight starts earning after the 24-hour warm-up, at the next
+    /// game-window boundary (`activationTime`). Staking again during a warm-up merges the amounts and
+    /// restarts the warm-up for the merged pending amount.
     function stake(uint256 amount) external nonReentrant {
         if (address(token) == address(0)) revert NotBound();
         if (amount < MIN_STAKE) revert BelowMinimum();
         _sync();
+        _settle(msg.sender);
         Account storage a = _accounts[msg.sender];
         _pull(address(token), msg.sender, amount);
+        uint64 at = activationTime(block.timestamp);
+        if (a.pending > 0) pendingAt[a.pendingActivateAt] -= a.pending;
         a.pending += amount;
-        uint64 at = uint64(block.timestamp) + WARMUP;
         a.pendingActivateAt = at;
+        pendingAt[at] += a.pending;
         totalStaked += amount;
-        _queue[queueTail++] = Activation(msg.sender, at);
+        if (queueTail == queueHead || _queue[queueTail - 1] != at) _queue[queueTail++] = at;
         emit Staked(msg.sender, amount, at);
+    }
+
+    /// @notice When stake made at time `t` starts earning: the first window boundary at or after t + 24h.
+    function activationTime(uint256 t) public pure returns (uint64) {
+        uint256 offset = GENESIS % ACTIVATION_GRID;
+        uint256 x = t + WARMUP - offset;
+        return uint64((x + ACTIVATION_GRID - 1) / ACTIVATION_GRID * ACTIVATION_GRID + offset);
     }
 
     /// @notice Stops weight immediately; tokens release 24 hours later via `withdrawUnstaked`.
     function requestUnstake(uint256 amount) external nonReentrant {
         if (amount == 0) revert InvalidAmount();
         _sync();
+        _settle(msg.sender);
         Account storage a = _accounts[msg.sender];
         if (a.active < amount) revert InsufficientStake();
-        _settle(msg.sender);
         a.active -= amount;
         totalWeight -= amount;
         _queueUnstake(msg.sender, amount);
@@ -391,9 +405,11 @@ contract HamsterVault {
     /// @notice Cancels the whole pending (warm-up) stake into the 24-hour unstake queue.
     function cancelPendingStake() external nonReentrant {
         _sync();
+        _settle(msg.sender);
         Account storage a = _accounts[msg.sender];
         uint256 amount = a.pending;
         if (amount == 0) revert InvalidAmount();
+        pendingAt[a.pendingActivateAt] -= amount;
         a.pending = 0;
         a.pendingActivateAt = 0;
         _queueUnstake(msg.sender, amount);
@@ -437,15 +453,16 @@ contract HamsterVault {
         emit RewardsClaimed(msg.sender, amount);
     }
 
-    /// @notice Processes up to `max` due warm-up activations without advancing past them. Only needed
-    /// when a backlog of activations makes the automatic sync revert `SyncRequired`.
-    function sync(uint256 max) external nonReentrant {
-        _processActivations(max);
+    /// @notice Brings the reward accumulator and due activations up to now. Never required: every
+    /// state-changing entry point syncs itself. Useful before reading `pendingRewards`.
+    function sync() external nonReentrant {
+        _sync();
     }
 
     // ----------------------------------------------------------------- reward sources
     /// @notice The hook's swap share: streamed to weight over 7 days. A deposit during a running
-    /// stream merges the leftover and restarts the 7 days.
+    /// stream merges with the leftover; the merged end is the amount-weighted average of the old end
+    /// and now + 7 days, so small deposits cannot stretch the leftover.
     function depositRewards(uint256 amount) external nonReentrant {
         if (amount == 0) revert InvalidAmount();
         _sync();
@@ -483,43 +500,36 @@ contract HamsterVault {
     }
 
     function _addToStream(Stream storage s, uint256 amount, uint64 duration) private returns (uint64 end) {
-        s.remaining += amount;
-        end = uint64(block.timestamp) + duration;
+        uint256 remaining = s.remaining;
+        uint256 fresh = block.timestamp + duration;
+        if (remaining == 0 || s.end <= block.timestamp) {
+            end = uint64(fresh);
+        } else {
+            end = uint64((remaining * s.end + amount * fresh) / (remaining + amount));
+        }
+        s.remaining = remaining + amount;
         s.end = end;
     }
 
     // ----------------------------------------------------------------- accounting core
-    /// @dev Brings the global accumulator to now: processes due activations in order (each at its own
-    /// time), then advances to the present. Reverts if more than MAX_SYNC activations are due; call
-    /// `sync` to drain them first.
+    /// @dev Brings the global accumulator to now: processes due activation times in order (each at its
+    /// own time, recording the accumulator there), then advances to the present. Activation times sit
+    /// on the hourly grid and every stake is itself a sync, so at most ~26 can be due at once.
     function _sync() private {
-        _processActivations(MAX_SYNC);
-        if (queueHead < queueTail && _queue[queueHead].activateAt <= block.timestamp) revert SyncRequired();
-        _advance(uint64(block.timestamp));
-    }
-
-    function _processActivations(uint256 max) private {
         uint256 head = queueHead;
-        uint256 n;
-        while (head < queueTail && n < max) {
-            Activation memory e = _queue[head];
-            if (e.activateAt > block.timestamp) break;
-            _advance(e.activateAt);
-            Account storage a = _accounts[e.account];
-            if (a.pendingActivateAt == e.activateAt && a.pending > 0) {
-                _settle(e.account);
-                uint256 amount = a.pending;
-                a.pending = 0;
-                a.pendingActivateAt = 0;
-                a.active += amount;
-                totalWeight += amount;
-                emit StakeActivated(e.account, amount, e.activateAt);
-            }
+        uint256 tail = queueTail;
+        while (head < tail) {
+            uint64 at = _queue[head];
+            if (at > block.timestamp) break;
+            _advance(at);
+            _rpwAt[at] = rewardPerWeight;
+            totalWeight += pendingAt[at];
+            delete pendingAt[at];
             delete _queue[head];
             ++head;
-            ++n;
         }
         queueHead = head;
+        _advance(uint64(block.timestamp));
     }
 
     /// @dev Flows rewards from `lastSync` to `t`. With zero weight every source pauses: streams extend
@@ -559,11 +569,26 @@ contract HamsterVault {
         s.remaining = remaining - paid;
     }
 
+    /// @dev Called only after `_sync`. A pending stake whose activation time has passed was already
+    /// added to total weight by `_sync`; here it is credited from the accumulator at that time.
     function _settle(address account) private {
         Account storage a = _accounts[account];
         uint256 w = a.active + a.grantBalance;
+        uint256 paid = a.rewardPerWeightPaid;
+        uint64 at = a.pendingActivateAt;
+        if (a.pending > 0 && at <= block.timestamp) {
+            uint256 rpwAt = _rpwAt[at];
+            if (w > 0) a.accrued += w * (rpwAt - paid) / ACC;
+            paid = rpwAt;
+            uint256 amount = a.pending;
+            a.pending = 0;
+            a.pendingActivateAt = 0;
+            a.active += amount;
+            w += amount;
+            emit StakeActivated(account, amount, at);
+        }
         uint256 rpw = rewardPerWeight;
-        if (w > 0) a.accrued += w * (rpw - a.rewardPerWeightPaid) / ACC;
+        if (w > 0) a.accrued += w * (rpw - paid) / ACC;
         a.rewardPerWeightPaid = rpw;
     }
 
@@ -628,17 +653,52 @@ contract HamsterVault {
     }
 
     /// @notice Registers a Squeek the caller owns, without transferring it. Earns boost only for
-    /// windows starting at least 24 hours later and is void once `ownerOf` changes.
+    /// windows starting at least 24 hours later and is void once `ownerOf` changes. Entries of the
+    /// caller's list that another wallet has since registered are pruned here.
     function registerSqueek(uint256 tokenId) external nonReentrant {
         if (!boostActive()) revert BoostNotActive();
         if (collection.ownerOf(tokenId) != msg.sender) revert NotOwnerOfToken();
         if (registrant[tokenId] == msg.sender) revert AlreadyRegistered();
         uint256[] storage list = _squeeks[msg.sender];
+        for (uint256 i; i < list.length;) {
+            uint256 id = list[i];
+            if (id == tokenId || registrant[id] != msg.sender) {
+                list[i] = list[list.length - 1];
+                list.pop();
+            } else {
+                ++i;
+            }
+        }
         if (list.length >= MAX_SQUEEKS) revert TooManyRegistrations();
+        address previous = registrant[tokenId];
+        if (previous != address(0)) emit SqueekVoided(previous, tokenId);
         registrant[tokenId] = msg.sender;
         registeredAt[tokenId] = uint64(block.timestamp);
         list.push(tokenId);
         emit SqueekRegistered(msg.sender, tokenId);
+    }
+
+    /// @notice Permanently voids `tokenId`'s registration if its registrant no longer owns it. Anyone
+    /// may call, e.g. the new owner or a keeper watching transfers. The former registrant must
+    /// register again and wait a fresh 24 hours. Claims also void any registration they observe.
+    function voidSqueek(uint256 tokenId) external {
+        address r = registrant[tokenId];
+        if (r == address(0)) revert NotRegistered();
+        if (_ownerOf(tokenId) == r) revert AlreadyRegistered();
+        _void(tokenId, r);
+    }
+
+    function _void(uint256 tokenId, address account) private {
+        delete registrant[tokenId];
+        delete registeredAt[tokenId];
+        emit SqueekVoided(account, tokenId);
+    }
+
+    /// @dev ownerOf, or address(0) when the call fails (a burned token).
+    function _ownerOf(uint256 tokenId) private view returns (address) {
+        (bool ok, bytes memory ret) = address(collection).staticcall(abi.encodeCall(IERC721.ownerOf, (tokenId)));
+        if (!ok || ret.length < 32) return address(0);
+        return abi.decode(ret, (address));
     }
 
     /// @notice Removes a token from the caller's registration list (frees a slot).
@@ -669,23 +729,37 @@ contract HamsterVault {
     function squeekEligible(uint256 tokenId, address account, uint256 k) public view returns (bool) {
         if (!boostActive() || registrant[tokenId] != account) return false;
         if (uint256(registeredAt[tokenId]) + REGISTRATION_LEAD > windowStart(k)) return false;
-        (bool ok, bytes memory ret) = address(collection).staticcall(abi.encodeCall(IERC721.ownerOf, (tokenId)));
-        if (!ok || ret.length < 32) return false;
-        return abi.decode(ret, (address)) == account;
+        return _ownerOf(tokenId) == account;
     }
 
-    function _allocateBoost(uint256 k, address account, uint256 wanted) private returns (uint256 got) {
+    /// @dev `pendingBoost` is boost already allocated earlier in the same claim batch (not yet in
+    /// `boostCommitted`). Registrations whose token left the registrant are voided when seen.
+    function _allocateBoost(uint256 k, address account, uint256 wanted, uint256 pendingBoost)
+        private
+        returns (uint256 got)
+    {
         if (!boostActive() || wanted == 0) return 0;
         uint256[] storage list = _squeeks[account];
         if (list.length == 0) return 0;
         uint256 day = uint256(windowStart(k)) / 1 days;
         uint256 left = BOOST_GLOBAL_DAILY_CAP - globalDayUsed[day];
-        uint256 bucketLeft = boostBucket - boostCommitted;
+        uint256 bucketLeft = boostBucket - boostCommitted - pendingBoost;
         if (left > bucketLeft) left = bucketLeft;
         if (wanted > left) wanted = left;
-        for (uint256 i; i < list.length && got < wanted; ++i) {
+        for (uint256 i; i < list.length && got < wanted;) {
             uint256 id = list[i];
-            if (!squeekEligible(id, account, k)) continue;
+            bool stale = registrant[id] != account;
+            if (!stale && _ownerOf(id) != account) {
+                _void(id, account);
+                stale = true;
+            }
+            if (stale) {
+                list[i] = list[list.length - 1];
+                list.pop();
+                continue;
+            }
+            ++i;
+            if (uint256(registeredAt[id]) + REGISTRATION_LEAD > windowStart(k)) continue;
             uint256 capLeft = BOOST_NFT_DAILY_CAP - nftDayUsed[id][day];
             uint256 take = wanted - got;
             if (take > capLeft) take = capLeft;
@@ -786,8 +860,13 @@ contract HamsterVault {
         v.active = a.active;
         v.pending = a.pending;
         v.pendingActivateAt = a.pendingActivateAt;
+        if (v.pending > 0 && v.pendingActivateAt <= block.timestamp) {
+            v.active += v.pending;
+            v.pending = 0;
+            v.pendingActivateAt = 0;
+        }
         v.grantBalance = a.grantBalance;
-        v.weight = a.active + a.grantBalance;
+        v.weight = v.active + v.grantBalance;
         v.pendingRewards = pendingRewards(account);
         Unstake[] storage us = _unstakes[account];
         for (uint256 i = a.unstakeCursor; i < us.length; ++i) {
@@ -802,13 +881,21 @@ contract HamsterVault {
         return _unstakes[account];
     }
 
-    /// @notice IMD `account` could claim now. Exact once due activations are synced; while some are
-    /// pending it reports the accumulator as if no weight activated since the last sync.
+    /// @notice IMD `account` could claim now. Exact when no activation time has passed since the last
+    /// sync; otherwise it projects without that weight (call `sync()` first for an exact figure).
     function pendingRewards(address account) public view returns (uint256) {
         Account storage a = _accounts[account];
         uint256 w = a.active + a.grantBalance;
+        uint256 paid = a.rewardPerWeightPaid;
+        uint256 accrued = a.accrued;
+        if (a.pending > 0 && a.pendingActivateAt <= lastSync) {
+            uint256 rpwAt = _rpwAt[a.pendingActivateAt];
+            accrued += w * (rpwAt - paid) / ACC;
+            paid = rpwAt;
+            w += a.pending;
+        }
         uint256 rpw = _projectedRewardPerWeight();
-        return a.accrued + (w == 0 ? 0 : w * (rpw - a.rewardPerWeightPaid) / ACC);
+        return accrued + (w == 0 ? 0 : w * (rpw - paid) / ACC);
     }
 
     function _projectedRewardPerWeight() private view returns (uint256 rpw) {

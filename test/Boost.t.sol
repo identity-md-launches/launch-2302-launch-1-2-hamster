@@ -138,6 +138,90 @@ contract BoostTest is VaultTest {
         assertFalse(vault.squeekEligible(1, alice, 10_000));
     }
 
+    function test_transferOutAndBackStaysVoid() public {
+        _activateBoost();
+        uint256 start300 = GENESIS + 300 * 3600;
+        _registerAt(alice, 1, start300 - 2 days);
+        squeek.transfer(1, bob);
+        // Bob (or any keeper) observes the transfer and voids alice's registration for good.
+        vm.prank(bob);
+        vault.voidSqueek(1);
+        assertEq(vault.registrant(1), address(0));
+        _skipTo(300);
+        vm.warp(start300 + 5 days);
+        _finalize(alice, 1e18);
+        squeek.transfer(1, alice); // back before the claim
+        (uint256 b, uint256 x) = vault.claimableMined(300, alice);
+        assertEq(b, 20_000e18);
+        assertEq(x, 0);
+        _claim(300, alice);
+        assertEq(vault.boostCommitted(), 0);
+    }
+
+    function test_voidSqueekChecks() public {
+        vm.expectRevert(HamsterVault.NotRegistered.selector);
+        vault.voidSqueek(1);
+        _activateBoost();
+        _registerAt(alice, 1, block.timestamp);
+        vm.expectRevert(HamsterVault.AlreadyRegistered.selector); // still owned: not voidable
+        vault.voidSqueek(1);
+        squeek.burn(1);
+        vault.voidSqueek(1);
+        assertEq(vault.registrant(1), address(0));
+    }
+
+    function test_claimObservingTransferVoidsPermanently() public {
+        _activateBoost();
+        uint256 start300 = GENESIS + 300 * 3600;
+        _registerAt(alice, 1, start300 - 2 days);
+        _skipTo(300);
+        vm.warp(start300 + 2 hours);
+        _finalize(alice, 1e18); // 300
+        _finalize(alice, 1e18); // 301
+        squeek.transfer(1, bob);
+        _claim(300, alice); // sees bob as owner: voids and prunes the list
+        assertEq(vault.registrant(1), address(0));
+        assertEq(vault.squeeksOf(alice).length, 0);
+        squeek.transfer(1, alice);
+        (, uint256 x) = vault.claimableMined(301, alice);
+        assertEq(x, 0);
+    }
+
+    function test_reRegisterDoesNotDuplicateList() public {
+        _activateBoost();
+        _registerAt(alice, 1, block.timestamp);
+        squeek.transfer(1, bob);
+        vm.prank(bob);
+        vault.registerSqueek(1);
+        squeek.transfer(1, alice);
+        vm.prank(alice);
+        vault.registerSqueek(1);
+        assertEq(vault.squeeksOf(alice).length, 1);
+        assertEq(vault.registrant(1), alice);
+    }
+
+    function test_batchClampsAtBoostBucketEnd() public {
+        _activateBoost();
+        uint256 start300 = GENESIS + 300 * 3600;
+        _registerAt(alice, 1, start300 - 2 days);
+        _skipTo(300);
+        vm.warp(start300 + 3 days);
+        _finalize(alice, 1e18); // 300
+        for (uint256 i; i < 23; ++i) {
+            game.finalizeEmpty();
+        }
+        _finalize(alice, 1e18); // 324, the next UTC day
+        assertEq(vm.load(address(vault), bytes32(uint256(4))), bytes32(0));
+        vm.store(address(vault), bytes32(uint256(4)), bytes32(uint256(50_000_000e18 - 15_000e18)));
+        assertEq(vault.boostCommitted(), 50_000_000e18 - 15_000e18);
+        uint256[] memory ws = new uint256[](2);
+        ws[0] = 300;
+        ws[1] = 324;
+        vault.claimMined(ws, alice);
+        assertEq(vault.boostCommitted(), vault.boostBucket());
+        assertEq(vault.grantsOf(alice)[0].amount, 40_000e18 + 15_000e18);
+    }
+
     function test_perNftDailyCap() public {
         _activateBoost();
         uint256 start300 = GENESIS + 300 * 3600;

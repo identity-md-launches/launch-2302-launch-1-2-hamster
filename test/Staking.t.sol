@@ -23,10 +23,10 @@ contract StakingTest is VaultTest {
         // Rewards streamed during the warm-up are not earned.
         _depositRewards(700e18);
         vm.warp(block.timestamp + 24 hours - 1);
-        vault.sync(10);
+        vault.sync();
         assertEq(vault.totalWeight(), 0);
         vm.warp(block.timestamp + 1);
-        vault.sync(10);
+        vault.sync();
         assertEq(vault.totalWeight(), 100e18);
         assertEq(vault.stakeInfo(alice).active, 100e18);
         assertEq(vault.pendingRewards(alice), 0);
@@ -56,10 +56,10 @@ contract StakingTest is VaultTest {
         _stake(alice, 50e18);
         assertEq(vault.stakeInfo(alice).pending, 150e18);
         vm.warp(block.timestamp + 12 hours);
-        vault.sync(10);
+        vault.sync();
         assertEq(vault.stakeInfo(alice).active, 0); // stale entry skipped
         vm.warp(block.timestamp + 12 hours);
-        vault.sync(10);
+        vault.sync();
         assertEq(vault.stakeInfo(alice).active, 150e18);
         assertEq(vault.totalWeight(), 150e18);
     }
@@ -71,28 +71,60 @@ contract StakingTest is VaultTest {
         assertEq(vault.stakeInfo(alice).pending, 0);
         assertEq(vault.stakeInfo(alice).unstaking, 100e18);
         vm.warp(block.timestamp + 24 hours);
-        vault.sync(10);
+        vault.sync();
         assertEq(vault.totalWeight(), 0);
         vm.prank(alice);
         vault.withdrawUnstaked();
         assertEq(hamster.balanceOf(alice), 100e18);
     }
 
-    function test_syncRequiredWithBacklog() public {
-        for (uint256 i; i < 70; ++i) {
-            address who = address(uint160(0x5000 + i));
-            _stake(who, 1e18);
-            vm.warp(block.timestamp + 1);
+    function test_warmupEndsOnNextWindowBoundary() public {
+        // setUp sits on a window boundary; one second later the warm-up runs to the next boundary.
+        assertEq(vault.activationTime(block.timestamp), block.timestamp + 24 hours);
+        assertEq(vault.activationTime(block.timestamp + 1), block.timestamp + 25 hours);
+        assertEq(vault.activationTime(block.timestamp + 3599), block.timestamp + 25 hours);
+        vm.warp(block.timestamp + 1);
+        _stake(alice, 10e18);
+        uint64 at = vault.stakeInfo(alice).pendingActivateAt;
+        vm.warp(at - 1);
+        vault.sync();
+        assertEq(vault.totalWeight(), 0);
+        vm.warp(at);
+        vault.sync();
+        assertEq(vault.totalWeight(), 10e18);
+    }
+
+    function test_manyDueActivationsNeverBlockDeposits() public {
+        _stake(alice, 100e18);
+        // 65 stakes in one block share one activation time: one queue entry.
+        address attacker = makeAddr("attacker");
+        _giveHamster(attacker, 65e18);
+        for (uint256 i; i < 65; ++i) {
+            vm.prank(attacker);
+            vault.stake(1e18);
         }
-        vm.warp(block.timestamp + 1 days);
-        _giveHamster(alice, 10e18);
+        // Stakes from many wallets spread over a day: every distinct time is an hourly grid point.
+        for (uint256 i; i < 200; ++i) {
+            vm.warp(block.timestamp + 7 minutes);
+            _stake(address(uint160(0x5000 + i)), 1e18);
+        }
+        assertLe(vault.queueTail() - vault.queueHead(), 26);
+        vm.warp(block.timestamp + 2 days);
+        _depositRewards(50e18);
+        _depositDrip(50e18);
+        assertEq(vault.totalWeight(), 100e18 + 65e18 + 200e18);
+        assertEq(vault.queueTail(), vault.queueHead());
+        assertEq(vault.stakeInfo(attacker).active, 65e18);
+    }
+
+    function test_lazyActivationCreditsFromActivationTime() public {
+        _stake(alice, 100e18);
+        _depositRewards(700e18); // paused until weight exists
+        vm.warp(block.timestamp + 24 hours + 1 days);
+        // Alice was never touched; her stake activated at +24h and earned one day.
         vm.prank(alice);
-        vm.expectRevert(HamsterVault.SyncRequired.selector);
-        vault.stake(10e18);
-        vault.sync(100);
-        vm.prank(alice);
-        vault.stake(10e18);
-        assertEq(vault.totalWeight(), 70e18);
+        vault.claimRewards();
+        assertApproxEqAbs(imd.balanceOf(alice), 100e18, 1e6);
     }
 
     // ----------------------------------------------------------------- unstake timing
@@ -160,7 +192,7 @@ contract StakingTest is VaultTest {
         _stake(alice, 10e18);
         assertEq(vault.pendingRewards(alice), 0);
         vm.warp(block.timestamp + 24 hours);
-        vault.sync(10);
+        vault.sync();
         assertEq(vault.pendingRewards(alice), 0);
         assertEq(vault.dripPot(), 1_000e18);
         HamsterVault.RewardsView memory r = vault.rewardsInfo();
@@ -182,7 +214,7 @@ contract StakingTest is VaultTest {
         vm.warp(block.timestamp + 10 days);
         _stake(bob, 10e18);
         vm.warp(block.timestamp + 24 hours);
-        vault.sync(10);
+        vault.sync();
         assertEq(vault.pendingRewards(bob), 0);
         vm.warp(block.timestamp + 6 days);
         assertApproxEqAbs(vault.pendingRewards(bob), 600e18, 1e9);
@@ -268,7 +300,7 @@ contract StakingTest is VaultTest {
     function test_dripOnePercentPerDay() public {
         _stake(alice, 10e18);
         vm.warp(block.timestamp + 24 hours);
-        vault.sync(10);
+        vault.sync();
         _depositDrip(10_000e18);
         vm.warp(block.timestamp + 1 days);
         vm.prank(alice);
@@ -297,7 +329,7 @@ contract StakingTest is VaultTest {
         vm.revertToState(snap);
         for (uint256 i; i < 24; ++i) {
             vm.warp(block.timestamp + 1 hours);
-            vault.sync(0);
+            vault.sync();
             vm.prank(alice);
             vault.claimRewards();
         }
@@ -353,9 +385,40 @@ contract StakingTest is VaultTest {
         _depositRewards(350e18);
         HamsterVault.RewardsView memory r = vault.rewardsInfo();
         assertApproxEqAbs(r.streamRemaining, 700e18, 1e6);
-        assertEq(r.streamEnd, block.timestamp + 7 days);
+        // Equal leftover (3.5 days left) and deposit (7 days): weighted end 5.25 days out.
+        assertApproxEqAbs(r.streamEnd, block.timestamp + 5.25 days, 1);
         vm.warp(block.timestamp + 7 days);
         assertApproxEqAbs(vault.pendingRewards(alice), 1_050e18, 1e6);
+    }
+
+    function test_dustDepositsCannotStretchStream() public {
+        _stake(alice, 100e18);
+        vm.warp(block.timestamp + 24 hours);
+        _depositRewards(7_000e18);
+        uint256 t0 = block.timestamp;
+        for (uint256 i = 1; i < 7; ++i) {
+            vm.warp(t0 + i * 1 days);
+            _depositRewards(1);
+            assertLe(vault.rewardsInfo().streamEnd, t0 + 7 days + 1);
+        }
+        vm.warp(t0 + 7 days + 1);
+        _depositRewards(1); // the old stream is fully paid; this wei starts a fresh one
+        assertEq(vault.rewardsInfo().streamRemaining, 1);
+        assertApproxEqAbs(vault.pendingRewards(alice), 7_000e18, 1e6);
+    }
+
+    function test_cancelThenRestakeKeepsBucketsConsistent() public {
+        _stake(alice, 100e18);
+        vm.warp(block.timestamp + 12 hours);
+        _stake(alice, 50e18); // moves the merged 150 to the later activation time
+        uint64 at = vault.stakeInfo(alice).pendingActivateAt;
+        assertEq(vault.pendingAt(at), 150e18);
+        vm.prank(alice);
+        vault.cancelPendingStake();
+        assertEq(vault.pendingAt(at), 0);
+        vm.warp(at + 1);
+        vault.sync();
+        assertEq(vault.totalWeight(), 0);
     }
 
     function test_depositZeroReverts() public {

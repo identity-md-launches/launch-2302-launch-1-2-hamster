@@ -40,17 +40,20 @@ deploys with them on an empty chain. This table is guidance for the separate man
 | --- | --- | --- | --- |
 | 1. Staking recipient on the game | TEAM | `HamsterHour.scheduleStakingRecipient(vault)` then `executeStakingRecipient(vault)` after 12 h | this vault's deployed address |
 | 2. Launch 2 | IMD | deploy HAMSTER with `remainderTo = vault` | delivers exactly 800,000,000 HAMSTER |
-| 3. Bind | TEAM, once | `bindToken(token)` | the HAMSTER token from launch 2. Requires `totalSupply() == 1e27` and `balanceOf(vault) == 8e26` |
+| 3. Bind | TEAM, once | `bindToken(token)` | the HAMSTER token from launch 2. Requires `totalSupply() == 1e27` and `balanceOf(vault) >= 8e26` |
 | 4. Hook wiring | launch 2's hook | `depositRewards(amount)` for its 0.5% swap share, `depositDrip(amount)` for 80% of the anti-snipe tax | the hook approves the vault for IMD and calls; both pull with `transferFrom` |
 | 5. Boost (optional, within 365 days) | TEAM, once | `scheduleBoost(collection)` then `activateBoost(collection)` after 12 h | the canonical Squeek NFT collection on Ethereum mainnet. Its address was not available to this task and could not be verified here, so it is a TEAM-supplied setting; the vault checks only that it is an ERC-721 contract (ERC-165). Activate before day 365 or anyone may `sweepBoost()` |
-| Keepers / anyone | anyone | `pullFromGame()` after fees allocate on the game; `claimMined(windows, account)`; `sync(n)` if ever needed | see below |
+| Keepers / anyone | anyone | `pullFromGame()` after fees allocate on the game; `claimMined(windows, account)`; `sync()` (optional, before reading `pendingRewards`); `voidSqueek(id)` when a registered Squeek changes hands | see below |
 
 Nothing else is configurable. There is no setter for IMD, the game, rates, durations or caps.
 
 ## Token bind and buckets
 
-`bindToken(token)` is TEAM-only, once, and requires the full 1e27 supply and exactly 8e26 HAMSTER
-already held by the vault. It sets the buckets: **mining 750,000,000** and **boost 50,000,000**.
+`bindToken(token)` is TEAM-only, once, and requires the full 1e27 supply and at least 8e26 HAMSTER
+already held by the vault. (It is `>=`, not `==`: HAMSTER is tradable before TEAM binds and the
+unbound vault has no way to send tokens out, so a 1-wei donation would otherwise lock the bind
+forever. Any surplus is untracked, like donations after the bind. The supply check stays strict as
+the brief asks; launch 2's token must not burn before the bind.) It sets the buckets: **mining 750,000,000** and **boost 50,000,000**.
 Claims, staking and grant withdrawals are refused until the token is bound (`NotBound`), but the
 game's loss history accrues independently, so every finalized window is claimable afterwards
 (retroactive from window 0). If `sweepBoost()` ran before the bind, the bind sets mining 800M and
@@ -89,29 +92,33 @@ weight immediately (no warm-up) and leave the weight when withdrawn.
 ## Staking (rewards in IMD only)
 
 - `stake(amount)` (min 1 HAMSTER): pulls liquid HAMSTER; the amount is pending for 24 hours
-  (`WARMUP`) and then becomes weight. Staking again during a warm-up merges the pending amount and
-  restarts the 24 hours for all of it. `cancelPendingStake()` moves the pending amount into the
+  (`WARMUP`), rounded up to the next game-window boundary (`activationTime(t)`, `ACTIVATION_GRID`
+  1 hour, so the warm-up is 24 to 25 hours), and then becomes weight. Staking again during a warm-up
+  merges the pending amount and restarts the warm-up for all of it. `cancelPendingStake()` moves the pending amount into the
   unstake queue.
 - `requestUnstake(amount)`: weight stops immediately; the tokens release 24 hours later
   (`UNSTAKE_DELAY`) through `withdrawUnstaked()`, which releases every matured request in order.
 - `claimRewards()`: pays the caller's earned IMD.
 - Weight = active stake + grant balance. HAMSTER held in the buckets is never weight.
 
-**Exact warm-up without keepers.** Warm-up ends are monotone in staking time, so pending stakes
-form a FIFO queue. Every state-changing call first replays the due activations in time order,
-advancing the reward accumulator to each activation second before adding its weight, then advances
-to now. A stake therefore earns from exactly its warm-up end even if nobody touched the vault for
-days (tested in `test_activationIsExactWithoutPoke`). A call processes at most 64 due activations
-(`MAX_SYNC`); if more are due it reverts `SyncRequired` and the public `sync(n)` drains them. The
-`pendingRewards` view does not replay the queue; call `sync` first for an exact figure while
-activations are due.
+**Exact warm-up without keepers.** Pending stakes are aggregated per activation time
+(`pendingAt[t]`), and activation times form a FIFO queue of distinct hourly grid points. Every
+state-changing call first replays the due activation times in order, advancing the reward
+accumulator to each one, recording it, and adding that time's pending amount to total weight, then
+advances to now. An account's own pending stake is moved to active lazily on its next interaction,
+credited from the recorded accumulator at its activation time. A stake therefore earns from exactly
+its warm-up end even if nobody touched the vault for days (`test_activationIsExactWithoutPoke`,
+`test_lazyActivationCreditsFromActivationTime`). Every stake is itself a sync, so at most ~26 grid
+points can be due at once: the sync never reverts and never needs batching, however many wallets
+stake (`test_manyDueActivationsNeverBlockDeposits`). The `pendingRewards` view does not replay due
+activations; call `sync()` first for an exact figure while one is due.
 
 **Reward sources** (all pro rata by weight over time, with a checkpoint before every weight change):
 
 | Source | Call | Schedule |
 | --- | --- | --- |
 | (a) game's 5% staker share | `pullFromGame()`, anyone | first pull = the pre-vault backlog, streamed over 30 days; later pulls join the 7-day stream |
-| (b) hook's 0.5% swap share | `depositRewards(amount)` | streamed over 7 days; a deposit during a running stream merges the leftover and restarts the 7 days |
+| (b) hook's 0.5% swap share | `depositRewards(amount)` | streamed over 7 days; a deposit during a running stream merges with the leftover and the end becomes the amount-weighted average of the old end and now + 7 days, so dust deposits cannot stretch the stream |
 | (c) 80% of the anti-snipe tax | `depositDrip(amount)` | perpetual drip: 1% of the remaining pot per day, continuous (`0.99^(dt/86400)` per second, `DRIP_FACTOR`), determined only by time, not by who calls |
 
 **Zero-weight periods.** When total weight is zero every source pauses: streams extend their end by
@@ -129,10 +136,19 @@ balances, stakes and unstaking). Both equal the token balances in the tests.
 - `registerSqueek(tokenId)`: the current `ownerOf` registers without transferring (max 20 per
   wallet, `unregisterSqueek` frees a slot). A registration earns only for windows that start 24 hours
   or more after it and is void as soon as `ownerOf` changes (a burned token is void, not a revert).
+  The void is permanent: whenever the vault observes `ownerOf != registrant` (in a claim, in the new
+  owner's `registerSqueek`, or in the permissionless `voidSqueek(tokenId)`) it deletes the
+  registration, so the former holder must register again and wait a fresh 24 hours. Only transfers
+  observed on chain can be enforced: a token that leaves and returns between two observations
+  (including a flash loan inside one transaction) cannot be seen by the vault. New owners and
+  keepers should call `voidSqueek` on transfers they see.
 - Boost = 50% of the base mined in the window, capped at 10,000 HAMSTER per NFT per UTC day and
   100,000 per UTC day globally (day = `windowStart(k) / 86400`), and by the 50M bucket. Allocation is
   deterministic: within a claim, a wallet's registered NFTs are filled in registration order; across
-  claims, the per-NFT and global daily caps are consumed in claim order. Base mining is never
+  claims, the per-NFT and global daily caps are consumed in claim order (the global 100k cap only
+  binds when more than ten fully eligible NFTs claim on one UTC day; a pro-rata split would need a
+  closed-day settlement round and is not implemented). Within one claim batch, windows clamp against
+  the remaining boost bucket in order. Base mining is never
   affected by the boost or by claim order. Boost vests in the same 7-day grant as the base.
 - `sweepBoost()`: if the boost was not activated within 365 days of deployment, anyone may move the
   50M boost bucket into the mining bucket once. The emission curve is unchanged, so under the current
@@ -150,9 +166,9 @@ activations), `squeeksOf`, `squeekEligible`, `nftDayUsed`, `globalDayUsed`, `tra
 
 ## Chosen values not fixed by the brief
 
-`MIN_STAKE` 1 HAMSTER, `MAX_CLAIM_BATCH` 48 windows, `MAX_SQUEEKS` 20 per wallet, `MAX_SYNC` 64
-activations per call, `MAX_GRANTS_PER_CALL` 64, later game pulls join the 7-day stream, re-staking
-during a warm-up restarts it, a cancelled pending stake waits the 24-hour unstake delay, boost
+`MIN_STAKE` 1 HAMSTER, `MAX_CLAIM_BATCH` 48 windows, `MAX_SQUEEKS` 20 per wallet, `ACTIVATION_GRID`
+1 hour (warm-up end rounding), `MAX_GRANTS_PER_CALL` 64, later game pulls join the 7-day stream, re-staking
+during a warm-up restarts it, weighted stream end on merged deposits, a cancelled pending stake waits the 24-hour unstake delay, boost
 allocation order (registration order within a wallet, claim order across wallets), the ERC-165 check
 as the only on-chain test of the collection.
 
