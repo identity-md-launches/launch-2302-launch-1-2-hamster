@@ -1,0 +1,13 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "HamsterVault",
+      "constructorArgs": [
+        "$owner",
+        "0xe33ab493249a2df0d8c4a71ac54f46d1f7778367"
+      ]
+    }
+  ],
+  "notes": "Launch 1 of 2 for HAMSTER on Ethereum mainnet: deploy HamsterVault with TEAM set to the launch wallet ($owner) and GAME set to HamsterHour v2. IMD is fixed in source at 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7. The constructor is nonpayable and requires no initialization. After deployment, TEAM schedules this vault as the game's staking recipient and completes the game's recipient change after its timelock. Launch 2 must use this vault as remainderTo, delivering exactly 800,000,000 HAMSTER; TEAM then calls bindToken with that token. Binding requires totalSupply of 1e27 and vault balance of 8e26, allocating 750M to mining and 50M to boost. Grants vest over seven days and count as staking weight; liquid stakes warm up for 24 hours. IMD rewards come from game pulls, seven-day reward streams and the perpetual drip; the first game pull streams over 30 days. Boost starts dormant. TEAM must select the canonical mainnet Squeek collection, schedule it and wait 12 hours before activation; the implementation checks ERC-721 support but does not enforce canonical collection identity. Boost daily caps are consumed in claim order. If boost remains inactive after 365 days, anyone may sweep its bucket into mining without changing the emission curve. No owner, pause, upgrade or administrative withdrawal entry point exists. TEAM's privileged operations are token binding and scheduling/activating boost."
+}
